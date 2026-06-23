@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Oficina · Pedidos</title>
+<link rel="stylesheet" href="style.css" />
+<style>
+  .grid { display: grid; gap: 14px; }
+  .drop {
+    border: 2px dashed var(--line); border-radius: var(--radius); background: var(--surface);
+    padding: 28px; text-align: center; cursor: pointer;
+  }
+  .drop.over { border-color: var(--brand); background: #f2f7ff; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  th { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+  tr.unmatched td { background: var(--red-bg); }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .row:last-child { border-bottom: none; }
+  .row:hover { background: #f7f8fa; }
+  .bar { height: 8px; background: #eef0f3; border-radius: 999px; overflow: hidden; width: 160px; }
+  .bar > i { display: block; height: 100%; background: var(--green); }
+  .flag { font-size: 12px; padding: 2px 8px; border-radius: 6px; }
+  .flag.partial { background: var(--amber-bg); color: var(--amber-ink); }
+  .flag.nostock { background: var(--red-bg); color: var(--red-ink); }
+  .hide { display: none; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 12px; color: var(--muted); }
+  .field input { font: inherit; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; }
+  h2 { font-size: 16px; margin: 24px 0 10px; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div><h1>Oficina</h1><div class="sub">Cargar pedidos · seguimiento en vivo</div></div>
+  <div><a href="warehouse.html" target="_blank">Abrir vista depósito ↗</a></div>
+</div>
+
+<div class="wrap">
+
+  <!-- Upload -->
+  <div id="uploadView">
+    <div class="grid" style="grid-template-columns: 1fr;">
+      <div id="drop" class="drop">
+        <div style="font-size:16px; font-weight:600;">Arrastrá el Excel del pedido aquí</div>
+        <div class="muted" style="margin-top:6px;">o hacé clic para elegir un archivo (.xlsx)</div>
+        <input id="file" type="file" accept=".xlsx,.xls" class="hide" />
+      </div>
+      <div style="text-align:center;">
+        <button class="btn ghost" id="genTest">o generá un pedido de prueba con SKUs reales</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Preview / confirm -->
+  <div id="previewView" class="hide">
+    <div class="card" style="padding:16px;">
+      <div style="display:flex; gap:14px; flex-wrap:wrap; align-items:end;">
+        <div class="field"><label>N.º de pedido</label><input id="ordNum" /></div>
+        <div class="field" style="flex:1;"><label>Cliente</label><input id="ordCust" placeholder="(opcional)" /></div>
+        <button class="btn primary" id="confirmOrder">Crear pedido</button>
+        <button class="btn ghost" id="cancelPreview">Cancelar</button>
+      </div>
+      <div id="mapControls" style="display:flex; gap:14px; flex-wrap:wrap; align-items:end; margin-top:14px; padding-top:14px; border-top:1px solid var(--line);">
+        <div class="field"><label>Hoja</label><select id="selSheet"></select></div>
+        <div class="field"><label>Fila de encabezado</label><select id="selHeader"></select></div>
+        <div class="field"><label>Columna SKU</label><select id="selSku"></select></div>
+        <div class="field"><label>Columna cantidad</label><select id="selQty"></select></div>
+      </div>
+      <div id="parseSummary" class="muted" style="margin-top:12px;"></div>
+      <div style="overflow:auto; max-height:50vh; margin-top:10px;">
+        <table id="previewTbl"></table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Dashboard -->
+  <h2>Pedidos</h2>
+  <div id="list" class="card"></div>
+
+  <!-- Order detail -->
+  <div id="detailView" class="hide">
+    <h2 id="detailTitle"></h2>
+    <div class="card" style="padding:16px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+        <div id="detailMeta" class="muted"></div>
+        <div style="display:flex; gap:8px;">
+          <button class="btn" id="exportCsv">Exportar resultado</button>
+          <button class="btn primary" id="markInvoice">Marcar para facturar</button>
+          <button class="btn ghost" id="closeDetail">Cerrar</button>
+        </div>
+      </div>
+      <div style="overflow:auto; margin-top:12px;"><table id="detailTbl"></table></div>
+    </div>
+  </div>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="config.js"></script>
+<script src="catalog.js"></script>
+<script src="store.js"></script>
+<script>
+const $ = (s) => document.querySelector(s);
+let parsed = null;          // current built result {lines, unmatched, matchedCount}
+let sheets = {};            // { sheetName: rows[][] }
+let mapping = null;         // { sheetName, headerRow, skuCol, qtyCol }
+
+// ---------- detection hints ----------
+const SKU_HINTS = ["sku","codigo","código","codigo art","code","cod","art","articulo","artículo","item","ref","producto"];
+const QTY_HINTS = ["cant","cantidad","qty","quantity","unid","pedido","solicit","order"];
+const DESC_HINTS = ["desc","descripcion","descripción","nombre","detalle","articulo","producto"];
+const BULK_HINTS = ["uxc","uxb","u/c","u/bulto","unxbulto","unidxbulto"]; // units per bulk
+const BULTOS_HINTS = ["bulto","bultos","cajas","caja"];                   // number of bulks
+const colLetter = (n) => XLSX.utils.encode_col(n);
+
+function cellHas(v, hints) {
+  const c = String(v == null ? "" : v).toLowerCase().trim();
+  if (!c || c.length > 24) return false;            // headers are short labels, not sentences
+  const tokens = c.split(/[\s/._-]+/);
+  // short hints (<=4) must match a whole token to avoid false hits inside words;
+  // longer hints may match as a substring.
+  return hints.some((h) => c === h || tokens.includes(h) || (h.length >= 5 && c.includes(h)));
+}
+function looksLikeLabel(sku) {
+  const s = sku.toLowerCase();
+  return /total|subtotal|observ|cliente|pedido|fecha|firma|nota/.test(s);
+}
+
+// How many real order lines does a (sheet, header, sku, qty) mapping yield?
+function buildLines(rows, headerRow, skuCol, qtyCol, descCol, bulkCol, bultosCol) {
+  const lines = [], unmatched = [];
+  let blankRun = 0;
+  const num = (r, c) => (c != null && c >= 0 ? parseInt(r[c], 10) : NaN);
+  for (let i = headerRow + 1; i < rows.length; i++) {
+    const r = rows[i] || [];
+    const sku = String(r[skuCol] == null ? "" : r[skuCol]).trim();
+    if (!sku || sku === "0") { blankRun++; if (blankRun >= 3 && lines.length) break; continue; }
+    blankRun = 0;
+    if (looksLikeLabel(sku)) continue;
+    let qty = num(r, qtyCol);
+    const prod = Store.lookupSku(sku);
+    // A row is a real line only if it cross-references OR has a positive quantity.
+    if (!prod && !(qty > 0)) continue;
+    if (isNaN(qty) || qty <= 0) qty = 1;
+    const orderDesc = descCol != null && descCol >= 0 ? String(r[descCol] == null ? "" : r[descCol]).trim() : "";
+    let upb = num(r, bulkCol); if (isNaN(upb) || upb <= 0) upb = 1;
+    let bultos = num(r, bultosCol);
+    if (isNaN(bultos) || bultos <= 0) bultos = upb > 1 ? Math.max(1, Math.round(qty / upb)) : qty;
+    lines.push({
+      id: Store.uid(), sku,
+      name: prod ? prod.name : (orderDesc || "(SKU sin nombre)"),
+      color: prod ? prod.color : "",
+      ean: prod ? prod.ean : "", dun: prod ? prod.dun : "",
+      qtyOrdered: qty, qtyPicked: 0, unitsPerBulk: upb, bultos: bultos, bultosPicked: 0,
+      status: "pending", matched: !!prod,
+    });
+    if (!prod) unmatched.push(sku);
+  }
+  return { lines, unmatched, matchedCount: lines.filter((l) => l.matched).length };
+}
+
+// Find the actual ORDER sheet/columns. The order is a sheet with a header row
+// containing BOTH a code and a quantity label, and a small contiguous block of
+// lines. Reference/portfolio sheets (no proper header) are ignored. Catalog
+// matches are only a weak tiebreaker, since a partial price list may not cover
+// every product in an order.
+function scoreCandidate(name, rows, h, sc, qc, dc, bc, btc, hasQty) {
+  const res = buildLines(rows, h, sc, qc, dc, bc, btc);
+  if (!res.lines.length) return null;
+  const orderName = /pedido|order|nota|remito/i.test(name) ? 3000 : 0;
+  const score = 1000 + (hasQty ? 4000 : 0) + orderName + Math.min(res.lines.length, 50) + res.matchedCount * 2;
+  return { sheetName: name, headerRow: h, skuCol: sc, qtyCol: qc, descCol: dc, bulkCol: bc, bultosCol: btc, score, lines: res.lines.length };
+}
+function autoDetect() {
+  let best = null;
+  for (const name of Object.keys(sheets)) {
+    const rows = sheets[name];
+    for (let h = 0; h < Math.min(rows.length, 25); h++) {
+      const hdr = rows[h] || [];
+      const skuCols = hdr.map((v, j) => (cellHas(v, SKU_HINTS) ? j : -1)).filter((j) => j >= 0);
+      const qtyCols = hdr.map((v, j) => (cellHas(v, QTY_HINTS) ? j : -1)).filter((j) => j >= 0);
+      if (!skuCols.length) continue;
+      const qc = qtyCols.length ? qtyCols[0] : -1;
+      const bc = hdr.map((v, j) => (cellHas(v, BULK_HINTS) ? j : -1)).filter((j) => j >= 0)[0];
+      const btc = hdr.map((v, j) => (cellHas(v, BULTOS_HINTS) ? j : -1)).filter((j) => j >= 0)[0];
+      for (const sc of skuCols) {
+        const dc = hdr.map((v, j) => (cellHas(v, DESC_HINTS) && j !== sc && j !== qc ? j : -1)).filter((j) => j >= 0)[0];
+        const cand = scoreCandidate(name, rows, h, sc, qc, dc == null ? -1 : dc,
+          bc == null ? -1 : bc, btc == null ? -1 : btc, qc >= 0);
+        if (cand && (!best || cand.score > best.score)) best = cand;
+      }
+    }
+  }
+  if (!best) {
+    const name = Object.keys(sheets)[0];
+    best = { sheetName: name, headerRow: -1, skuCol: 0, qtyCol: 1, descCol: -1, bulkCol: -1, bultosCol: -1, score: 0 };
+  }
+  return best;
+}
+
+// Pull order metadata (customer, doc number, account) from label cells near the top.
+function extractMeta(rows) {
+  const meta = { customer: "", number: "", account: "" };
+  const labels = [
+    ["customer", /^cliente/i], ["number", /^n(ú|u)mero/i], ["account", /^n.*\bcta|cuenta|c[oó]digo/i],
+  ];
+  for (let i = 0; i < Math.min(rows.length, 12); i++) {
+    const r = rows[i] || [];
+    for (let j = 0; j < r.length; j++) {
+      const cell = String(r[j] == null ? "" : r[j]).trim();
+      for (const [key, re] of labels) {
+        if (re.test(cell) && !meta[key]) {
+          for (let k = j + 1; k < Math.min(r.length, j + 4); k++) {
+            const v = String(r[k] == null ? "" : r[k]).trim();
+            if (v) { meta[key] = v; break; }
+          }
+        }
+      }
+    }
+  }
+  return meta;
+}
+
+// ---------- preview + column picker ----------
+function populateSelectors() {
+  const rows = sheets[mapping.sheetName];
+  const ncols = rows.reduce((m, r) => Math.max(m, r ? r.length : 0), 0);
+  const selSheet = $("#selSheet"), selHeader = $("#selHeader"), selSku = $("#selSku"), selQty = $("#selQty");
+  selSheet.innerHTML = Object.keys(sheets).map((n) => `<option ${n === mapping.sheetName ? "selected" : ""}>${n}</option>`).join("");
+  selHeader.innerHTML = `<option value="-1" ${mapping.headerRow < 0 ? "selected" : ""}>(sin encabezado)</option>` +
+    rows.slice(0, 20).map((r, i) => {
+      const label = (r || []).map((c) => String(c == null ? "" : c)).filter(Boolean).slice(0, 4).join(" | ").slice(0, 40);
+      return `<option value="${i}" ${i === mapping.headerRow ? "selected" : ""}>Fila ${i + 1}: ${label || "(vacía)"}</option>`;
+    }).join("");
+  const colOpts = (sel) => Array.from({ length: ncols }, (_, j) => {
+    const hdr = mapping.headerRow >= 0 ? String((rows[mapping.headerRow] || [])[j] == null ? "" : (rows[mapping.headerRow] || [])[j]) : "";
+    return `<option value="${j}" ${j === sel ? "selected" : ""}>Col ${colLetter(j)}${hdr ? " · " + hdr.slice(0, 18) : ""}</option>`;
+  }).join("");
+  selSku.innerHTML = colOpts(mapping.skuCol);
+  selQty.innerHTML = `<option value="-1" ${mapping.qtyCol < 0 ? "selected" : ""}>(sin columna)</option>` + colOpts(mapping.qtyCol);
+}
+
+function reparse() {
+  const rows = sheets[mapping.sheetName];
+  parsed = buildLines(rows, mapping.headerRow, mapping.skuCol, mapping.qtyCol, mapping.descCol, mapping.bulkCol, mapping.bultosCol);
+  const m = parsed.matchedCount;
+  $("#parseSummary").innerHTML =
+    `<b>${parsed.lines.length}</b> líneas · <b>${m}</b> cruzadas con la lista de precios` +
+    (parsed.unmatched.length ? ` · <span style="color:var(--red-ink)">${parsed.unmatched.length} sin coincidencia</span>` : "") +
+    (parsed.lines.length > 200 ? ` · <span style="color:var(--red-ink)">¿demasiadas? revisá la columna SKU arriba</span>` : "");
+  $("#previewTbl").innerHTML = "<tr><th>SKU</th><th>Producto</th><th>EAN</th><th>DUN</th><th>Bultos</th><th>U/bulto</th><th>Unid.</th></tr>" +
+    parsed.lines.slice(0, 300).map((l) => `<tr class="${l.matched ? "" : "unmatched"}">
+      <td class="mono">${l.sku}</td><td>${l.name}</td>
+      <td class="mono">${l.ean || "—"}</td><td class="mono">${l.dun || "—"}</td>
+      <td><b>${l.bultos}</b></td><td>${l.unitsPerBulk}</td><td>${l.qtyOrdered}</td></tr>`).join("");
+}
+
+function showPreview(suggestedNum) {
+  $("#uploadView").classList.add("hide");
+  $("#previewView").classList.remove("hide");
+  const meta = extractMeta(sheets[mapping.sheetName]);
+  $("#ordNum").value = suggestedNum || meta.number || "";
+  $("#ordCust").value = meta.customer || "";
+  populateSelectors();
+  reparse();
+}
+
+// react to manual column-picker changes
+function wireSelectors() {
+  $("#selSheet").addEventListener("change", (e) => {
+    mapping = autoDetectForSheet(e.target.value);
+    populateSelectors(); reparse();
+  });
+  $("#selHeader").addEventListener("change", (e) => { mapping.headerRow = parseInt(e.target.value, 10); populateSelectors(); reparse(); });
+  $("#selSku").addEventListener("change", (e) => { mapping.skuCol = parseInt(e.target.value, 10); reparse(); });
+  $("#selQty").addEventListener("change", (e) => { mapping.qtyCol = parseInt(e.target.value, 10); reparse(); });
+}
+function autoDetectForSheet(name) {
+  const saved = sheets; sheets = { [name]: saved[name] };
+  const best = autoDetect(); sheets = saved; return best;
+}
+
+// order number from filename: "37653-9067.xlsx" -> "9067"
+function numFromName(name) {
+  const base = name.replace(/\.[^.]+$/, "");
+  const parts = base.split(/[-_ ]+/).map((s) => s.trim()).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : base;
+}
+
+function handleFile(file) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const wb = XLSX.read(e.target.result, { type: "array" });
+    sheets = {};
+    wb.SheetNames.forEach((n) => {
+      sheets[n] = XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: "" });
+    });
+    mapping = autoDetect();
+    showPreview(numFromName(file.name));
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+// ---------- Upload wiring ----------
+const drop = $("#drop");
+drop.addEventListener("click", () => $("#file").click());
+$("#file").addEventListener("change", (e) => e.target.files[0] && handleFile(e.target.files[0]));
+["dragover","dragenter"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave","drop"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", (e) => { const f = e.dataTransfer.files[0]; if (f) handleFile(f); });
+wireSelectors();
+
+$("#cancelPreview").addEventListener("click", () => {
+  parsed = null; $("#previewView").classList.add("hide"); $("#uploadView").classList.remove("hide");
+});
+$("#confirmOrder").addEventListener("click", () => {
+  if (!parsed || !parsed.lines.length) { alert("No hay líneas para crear el pedido. Revisá la columna SKU."); return; }
+  Store.addOrder({
+    number: $("#ordNum").value.trim() || ("S/N-" + Date.now().toString().slice(-4)),
+    customer: $("#ordCust").value.trim(),
+    lines: parsed.lines,
+  });
+  parsed = null;
+  $("#previewView").classList.add("hide"); $("#uploadView").classList.remove("hide");
+  $("#ordCust").value = "";
+});
+
+$("#genTest").addEventListener("click", () => {
+  const pool = window.CATALOG.filter((p) => p.ean);
+  const pick = [];
+  const used = new Set();
+  while (pick.length < 6 && pick.length < pool.length) {
+    const p = pool[Math.floor(Math.random() * pool.length)];
+    if (used.has(p.sku)) continue;
+    used.add(p.sku);
+    const upb = [1, 1, 6, 12, 24][Math.floor(Math.random() * 5)];
+    const bultos = 1 + Math.floor(Math.random() * 4);
+    pick.push({
+      id: Store.uid(), sku: p.sku, name: p.name, color: p.color,
+      ean: p.ean, dun: p.dun, qtyOrdered: upb * bultos, unitsPerBulk: upb, bultos: bultos, bultosPicked: 0,
+      qtyPicked: 0, status: "pending", matched: true,
+    });
+  }
+  Store.addOrder({ number: "TEST-" + Date.now().toString().slice(-4), customer: "Pedido de prueba", lines: pick });
+});
+
+// ---------- Dashboard ----------
+function statusPill(o) {
+  const map = { new: "Nuevo", picking: "En depósito", ready: "Listo p/ facturar" };
+  return `<span class="pill ${o.status}">${map[o.status]}</span>`;
+}
+function renderList() {
+  const orders = Store.getOrders();
+  const list = $("#list");
+  if (!orders.length) { list.innerHTML = `<div class="row" style="cursor:default; color:var(--muted)">Todavía no hay pedidos. Cargá un Excel arriba.</div>`; return; }
+  list.innerHTML = orders.map((o) => {
+    const total = o.lines.length, done = o.resolvedCount || 0;
+    const pct = total ? Math.round(done / total * 100) : 0;
+    const partials = o.lines.filter((l) => l.status === "partial").length;
+    const nostock = o.lines.filter((l) => l.status === "nostock").length;
+    let flags = "";
+    if (partials) flags += `<span class="flag partial">${partials} parcial</span> `;
+    if (nostock) flags += `<span class="flag nostock">${nostock} sin stock</span>`;
+    return `<div class="row" data-id="${o.id}">
+      <div>
+        <div style="font-weight:600;">Pedido ${o.number} ${o.customer ? '· <span class="muted">' + o.customer + "</span>" : ""}</div>
+        <div class="muted" style="font-size:13px; margin-top:2px;">${total} líneas · ${done}/${total} resueltas ${flags}</div>
+      </div>
+      <div style="display:flex; align-items:center; gap:14px;">
+        <div class="bar"><i style="width:${pct}%"></i></div>
+        ${statusPill(o)}
+      </div>
+    </div>`;
+  }).join("");
+  list.querySelectorAll(".row[data-id]").forEach((el) =>
+    el.addEventListener("click", () => openDetail(el.dataset.id)));
+}
+
+// ---------- Detail ----------
+let detailId = null;
+function openDetail(id) {
+  detailId = id;
+  const o = Store.getOrder(id);
+  if (!o) return;
+  $("#detailView").classList.remove("hide");
+  $("#detailView").scrollIntoView({ behavior: "smooth" });
+  renderDetail();
+}
+function renderDetail() {
+  const o = Store.getOrder(detailId);
+  if (!o) { $("#detailView").classList.add("hide"); return; }
+  $("#detailTitle").textContent = "Pedido " + o.number;
+  $("#detailMeta").innerHTML = `${o.customer || "Sin cliente"} · ${statusPill(o)} · ${o.resolvedCount}/${o.lines.length} resueltas`;
+  const stmap = {
+    pending: '<span class="muted">Pendiente</span>',
+    picked: '<span style="color:var(--green-ink)">✓ Pickeado</span>',
+    partial: '<span class="flag partial">Parcial</span>',
+    nostock: '<span class="flag nostock">Sin stock</span>',
+  };
+  const bultosPicked = (l) => l.status === "nostock" ? 0 : l.status === "partial" ? (l.bultosPicked || 0) : l.status === "picked" ? (l.bultos || 1) : "—";
+  $("#detailTbl").innerHTML =
+    "<tr><th>SKU</th><th>Producto</th><th>EAN / DUN</th><th>Bultos ped.</th><th>Bultos pick.</th><th>Unid.</th><th>Estado</th></tr>" +
+    o.lines.map((l) => `<tr>
+      <td class="mono">${l.sku}</td><td>${l.name}</td>
+      <td class="mono" style="font-size:12px;">${l.ean || "—"}<br>${l.dun || "—"}</td>
+      <td><b>${l.bultos || 1}</b></td><td>${bultosPicked(l)}</td><td class="muted">${l.qtyOrdered}</td>
+      <td>${stmap[l.status]}</td></tr>`).join("");
+  $("#markInvoice").disabled = o.status !== "ready";
+  $("#markInvoice").style.opacity = o.status === "ready" ? 1 : 0.5;
+}
+$("#closeDetail").addEventListener("click", () => { detailId = null; $("#detailView").classList.add("hide"); });
+$("#markInvoice").addEventListener("click", () => {
+  if (detailId) { Store.setOrderStatus(detailId, "ready"); alert("Pedido marcado. (Acá se conectaría la facturación.)"); }
+});
+$("#exportCsv").addEventListener("click", () => {
+  const o = Store.getOrder(detailId); if (!o) return;
+  const head = ["SKU","Producto","EAN","DUN","Bultos pedidos","U/bulto","Unidades","Bultos pickeados","Estado"];
+  const rows = o.lines.map((l) => [l.sku, l.name, l.ean, l.dun, l.bultos || 1, l.unitsPerBulk || 1, l.qtyOrdered,
+    l.status === "picked" ? (l.bultos || 1) : l.status === "partial" ? (l.bultosPicked || 0) : 0, l.status]);
+  const csv = [head, ...rows].map((r) => r.map((c) => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  a.download = "pedido_" + o.number + ".csv"; a.click();
+});
+
+// ---------- Live refresh ----------
+Store.subscribe(() => { renderList(); if (detailId) renderDetail(); });
+renderList();
+</script>
+</body>
+</html>
