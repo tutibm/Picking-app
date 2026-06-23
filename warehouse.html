@@ -3,8 +3,11 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
 <title>Depósito · Picking</title>
-<link rel="stylesheet" href="style.css" />
+<link rel="stylesheet" href="style.css?v=3" />
 <style>
   body { background: #f0f1f3; }
   .app { max-width: 560px; margin: 0 auto; min-height: 100vh; background: var(--bg); }
@@ -62,6 +65,8 @@
   .badge.picked { background: var(--green-bg); color: var(--green-ink); }
   .badge.partial { background: var(--amber-bg); color: var(--amber-ink); }
   .badge.nostock { background: var(--red-bg); color: var(--red-ink); }
+  .badge.progress { background: #e6f1fb; color: #185fa5; }
+  .line.inprogress { border-left-color: var(--brand); }
   .acts { display:flex; gap:10px; margin-top: 14px; }
   .big { flex:1; height: 56px; font-size: 16px; font-weight: 700; border-radius: 12px; border:1.5px solid; background:#fff; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px; }
   .big:active { transform: scale(.98); }
@@ -96,9 +101,9 @@
 
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<script src="config.js"></script>
-<script src="catalog.js"></script>
-<script src="store.js"></script>
+<script src="config.js?v=3"></script>
+<script src="catalog.js?v=3"></script>
+<script src="store.js?v=3"></script>
 <script>
 const app = document.getElementById("app");
 let currentOrderId = null;
@@ -163,16 +168,21 @@ function renderPicking() {
       <div id="reader" class="hide"></div>
     </div>`;
 
-  html += o.lines.map((l) => lineHtml(l)).join("");
+  html += o.lines.slice().sort((a, b) => skuCompare(a.sku, b.sku)).map((l) => lineHtml(l)).join("");
 
   if (o.complete) {
     html += `<div class="done"><div class="ico">✅</div><h2>Pedido completo</h2>
       <div class="muted">Enviado a la oficina para facturar.</div>
       <div style="margin-top:18px;"><button class="btn" id="back2">Volver a pedidos</button></div></div>`;
   } else {
+    const can = o.canFinalize;
+    const pend = tot - (o.resolvedCount || 0);
     html += `<div style="padding:20px 12px 32px; text-align:center;">
-      <button class="btn primary" id="finalize" style="width:100%; max-width:520px; height:52px; font-size:16px; font-weight:700;">Finalizar pedido y enviar a oficina</button>
-      <div class="muted" style="font-size:12px; margin-top:8px;">Usalo cuando terminaste, aunque queden parciales o sin stock.</div>
+      <button class="btn primary" id="finalize" ${can ? "" : "disabled"}
+        style="width:100%; max-width:520px; height:52px; font-size:16px; font-weight:700; opacity:${can ? 1 : 0.45}; cursor:${can ? "pointer" : "not-allowed"};">Finalizar pedido y enviar a oficina</button>
+      <div class="muted" style="font-size:12px; margin-top:8px;">${can
+        ? "Usalo cuando terminaste, aunque queden parciales o sin stock."
+        : "Faltan " + pend + " línea(s) por marcar (listo / parcial / sin stock)."}</div>
     </div>`;
   }
   app.innerHTML = html;
@@ -191,6 +201,21 @@ function renderPicking() {
   refocus();
 }
 
+// Natural SKU sort: split into digit / non-digit chunks and compare numerically
+// where both are numbers. Keeps a base code and its "/" variants together
+// (e.g. 2215, 2215/20, 2215/5) and orders bases naturally (717 < 2215 < 12310).
+function skuCompare(a, b) {
+  const ax = String(a).match(/(\d+|\D+)/g) || [];
+  const bx = String(b).match(/(\d+|\D+)/g) || [];
+  for (let i = 0; i < Math.min(ax.length, bx.length); i++) {
+    if (ax[i] === bx[i]) continue;
+    const aNum = /^\d+$/.test(ax[i]), bNum = /^\d+$/.test(bx[i]);
+    if (aNum && bNum) return parseInt(ax[i], 10) - parseInt(bx[i], 10);
+    return ax[i] < bx[i] ? -1 : 1;
+  }
+  return ax.length - bx.length;
+}
+
 function lineHtml(l) {
   const upb = l.unitsPerBulk || 1;
   const bultos = l.bultos || 1;
@@ -200,7 +225,8 @@ function lineHtml(l) {
   let badge = "";
   if (l.status === "picked") badge = `<span class="badge picked">✓ Listo</span>`;
   else if (l.status === "nostock") badge = `<span class="badge nostock">Sin stock</span>`;
-  else if (l.status === "partial") badge = `<span class="badge partial">${picked}/${l.qtyOrdered} u</span>`;
+  else if (l.status === "partial" && l.committed) badge = `<span class="badge partial">Parcial ${picked}/${l.qtyOrdered} u</span>`;
+  else if (picked > 0) badge = `<span class="badge progress">Escaneando ${picked}/${l.qtyOrdered} u</span>`;
 
   const acts = `<div class="acts">
       <button class="big nostock" data-act="nostock" data-id="${l.id}">✕ Sin stock</button>
@@ -209,14 +235,15 @@ function lineHtml(l) {
     </div>`;
   const undo = `<button class="undo" data-act="undo" data-id="${l.id}">↺ Deshacer</button>`;
   let body;
-  if (l.status === "picked" || l.status === "nostock") body = undo;
-  else if (l.status === "partial") body = acts + undo;     // in progress: keep acting, allow reset
-  else body = acts;
+  if (l.committed) body = undo;                 // resolved (Listo / Sin stock / Parcial)
+  else if (picked > 0) body = acts + undo;      // in progress: keep going or reset
+  else body = acts;                              // untouched
 
   const detail = `${l.qtyOrdered} u · ${bultos} ${bultos === 1 ? "bulto" : "bultos"}${upb > 1 ? ` · ${upb} u/bulto` : ""}`;
   const bigNum = l.status === "picked" ? "✓" : remaining;
   const bigLbl = l.status === "picked" ? "listo" : "u. faltan";
-  return `<div class="line ${l.status}">
+  const inProgress = !l.committed && picked > 0 ? " inprogress" : "";
+  return `<div class="line ${l.status}${inProgress}">
     <div style="display:flex; justify-content:space-between; gap:12px;">
       <div style="flex:1;">
         <div class="lsku">${l.sku}</div>
@@ -257,9 +284,9 @@ function onAct(e) {
     clearTimeout(armTimer);
   }
   const l = lineById(id);
-  if (act === "pick") setLine(id, { status: "picked", qtyPicked: l.qtyOrdered, bultosPicked: l.bultos });
-  else if (act === "nostock") setLine(id, { status: "nostock", qtyPicked: 0, bultosPicked: 0 });
-  else if (act === "undo") setLine(id, { status: "pending", qtyPicked: 0, bultosPicked: 0 });
+  if (act === "pick") setLine(id, { status: "picked", qtyPicked: l.qtyOrdered, bultosPicked: l.bultos, committed: true });
+  else if (act === "nostock") setLine(id, { status: "nostock", qtyPicked: 0, bultosPicked: 0, committed: true });
+  else if (act === "undo") setLine(id, { status: "pending", qtyPicked: 0, bultosPicked: 0, committed: false });
   else if (act === "partial") openNumpad(id);
 }
 function lineById(id) { return Store.getOrder(currentOrderId).lines.find((l) => l.id === id); }
@@ -276,13 +303,26 @@ function applyPick(id, deltaUnits) {
   let picked = (l.qtyPicked || 0) + deltaUnits;
   picked = Math.max(0, Math.min(l.qtyOrdered, picked));
   const upb = l.unitsPerBulk || 1;
-  const status = picked >= l.qtyOrdered ? "picked" : picked > 0 ? "partial" : "pending";
-  Store.updateLine(currentOrderId, id, { status, qtyPicked: picked, bultosPicked: Math.floor(picked / upb) });
+  const full = picked >= l.qtyOrdered;
+  const status = full ? "picked" : picked > 0 ? "partial" : "pending";
+  // Scanning only COMMITS the line when it's fully picked; otherwise it's "in progress".
+  Store.updateLine(currentOrderId, id, { status, qtyPicked: picked, bultosPicked: Math.floor(picked / upb), committed: full });
   return { picked, status, remaining: l.qtyOrdered - picked, line: l };
 }
 
+// The core 12 digits (GTIN-12) shared by a product's EAN-13 and its DUN-14.
+// EAN-13  = CORE(12) + check          -> ean.slice(0,12)
+// DUN-14  = indicator(1) + CORE(12) + check -> dun.slice(1,13)
+function gtinCore(code) {
+  if (/^\d{14}$/.test(code)) return code.slice(1, 13);
+  if (/^\d{13}$/.test(code)) return code.slice(0, 12);
+  return null;
+}
+function lineCore(l) { return l.ean ? l.ean.slice(0, 12) : (l.dun ? l.dun.slice(1, 13) : ""); }
+
 // Interpret a scanned/typed code. EAN (13 digits) = +1 unit; DUN (14) = +UxC units.
-// A typed SKU completes the whole line.
+// We match on the shared 12-digit core, so a DUN scan works even when no DUN was
+// stored for the product (every product has an EAN). A typed SKU completes the line.
 function processScan(rawCode) {
   const code = String(rawCode || "").trim();
   if (!code) return;
@@ -290,8 +330,14 @@ function processScan(rawCode) {
   if (!o) return;
   let line = null, delta = 1, kind = "unidad";
 
-  if (/^\d{14}$/.test(code)) { line = o.lines.find((l) => l.dun === code); kind = "bulto"; if (line) delta = line.unitsPerBulk || 1; }
-  else if (/^\d{13}$/.test(code)) { line = o.lines.find((l) => l.ean === code); delta = 1; kind = "unidad"; }
+  if (/^\d{14}$/.test(code)) {
+    kind = "bulto";
+    line = o.lines.find((l) => l.dun === code) || o.lines.find((l) => lineCore(l) === code.slice(1, 13));
+    if (line) delta = line.unitsPerBulk || 1;
+  } else if (/^\d{13}$/.test(code)) {
+    kind = "unidad"; delta = 1;
+    line = o.lines.find((l) => l.ean === code) || o.lines.find((l) => lineCore(l) === code.slice(0, 12));
+  }
 
   if (!line) {                                  // fallback: EAN/DUN/SKU regardless of length
     line = Store.matchScan(o, code);
@@ -342,8 +388,8 @@ function renderSuggestions(query) {
     const l = lineById(el.dataset.sid);
     const input = document.getElementById("scan"); if (input) input.value = "";
     hideSuggestions();
-    if (!l || l.status !== "pending") { flash("Ya estaba resuelto: " + (l ? l.name : ""), "var(--amber-ink)"); refocus(); return; }
-    Store.updateLine(currentOrderId, l.id, { status: "picked", qtyPicked: l.qtyOrdered, bultosPicked: l.bultos });
+    if (!l || l.status === "picked") { flash("Ya estaba resuelto: " + (l ? l.name : ""), "var(--amber-ink)"); refocus(); return; }
+    Store.updateLine(currentOrderId, l.id, { status: "picked", qtyPicked: l.qtyOrdered, bultosPicked: l.bultos, committed: true });
     flash("✓ " + l.name, "var(--green-ink)"); beep(true);
     render();
   }));
@@ -364,12 +410,15 @@ function beep(ok) {
 
 // ---------- numpad ----------
 function openNumpad(id) {
-  const l = lineById(id); let val = "";
+  const l = lineById(id);
+  // pre-fill with whatever was already scanned, so "got 12, rest missing" is one tap
+  let val = (l.qtyPicked > 0 && l.qtyPicked < l.qtyOrdered) ? String(l.qtyPicked) : "";
   const modal = document.createElement("div");
   modal.className = "modal";
-  const tot = l.bultos || 1;
+  const tot = l.qtyOrdered;
+  const upbTxt = (l.unitsPerBulk || 1) > 1 ? ` (${l.bultos} bultos · ${l.unitsPerBulk} u/bulto)` : "";
   modal.innerHTML = `<div class="sheet">
-    <h3>${l.name}</h3><div class="muted">¿Cuántos bultos de ${tot} pudiste pickear?</div>
+    <h3>${l.name}</h3><div class="muted">¿Cuántas unidades de ${tot} pudiste pickear?${upbTxt}</div>
     <div class="npdisplay" id="npd">0</div>
     <div class="npgrid">${[1,2,3,4,5,6,7,8,9].map((n)=>`<button data-n="${n}">${n}</button>`).join("")}
       <button data-n="del">⌫</button><button data-n="0">0</button><button data-n="ok" style="color:var(--green-ink)">OK</button></div>
@@ -382,9 +431,9 @@ function openNumpad(id) {
   const save = () => {
     const v = parseInt(val || "0", 10);
     const upb = l.unitsPerBulk || 1;
-    if (v <= 0) setLine(id, { status: "nostock", qtyPicked: 0, bultosPicked: 0 });
-    else if (v >= tot) setLine(id, { status: "picked", qtyPicked: l.qtyOrdered, bultosPicked: tot });
-    else setLine(id, { status: "partial", qtyPicked: v * upb, bultosPicked: v });
+    if (v <= 0) setLine(id, { status: "nostock", qtyPicked: 0, bultosPicked: 0, committed: true });
+    else if (v >= tot) setLine(id, { status: "picked", qtyPicked: tot, bultosPicked: Math.floor(tot / upb), committed: true });
+    else setLine(id, { status: "partial", qtyPicked: v, bultosPicked: Math.floor(v / upb), committed: true });
     document.body.removeChild(modal);
   };
   modal.querySelectorAll(".npgrid button").forEach((b) => b.onclick = () => {

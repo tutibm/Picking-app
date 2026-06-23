@@ -23,12 +23,15 @@
 
   function rollup(order) {
     const lines = order.lines || [];
-    const resolved = lines.filter((l) => l.status !== "pending").length;
+    // A line counts as resolved only once the picker COMMITS it (Listo / Sin stock
+    // / Parcial). A line scanned partway is "in progress" and does NOT count.
+    const resolved = lines.filter((l) => l.committed).length;
     const allPicked = lines.length > 0 && lines.every((l) => l.status === "picked");
+    order.canFinalize = lines.length > 0 && lines.every((l) => l.committed);
     order.complete = !!order.finalized || allPicked;   // auto when all picked, or explicit finalize
     order.resolvedCount = resolved;
     if (order.complete) order.status = "ready";
-    else if (resolved > 0) order.status = "picking";
+    else if (lines.some((l) => l.status !== "pending")) order.status = "picking";
     else order.status = "new";
     return order;
   }
@@ -39,7 +42,7 @@
       ean: l.ean, dun: l.dun,
       qtyOrdered: l.qty_ordered, qtyPicked: l.qty_picked,
       unitsPerBulk: l.units_per_bulk, bultos: l.bultos, bultosPicked: l.bultos_picked,
-      status: l.status, matched: l.matched,
+      status: l.status, committed: l.committed, matched: l.matched,
     };
   }
 
@@ -116,6 +119,7 @@
       if (patch.status !== undefined) upd.status = patch.status;
       if (patch.qtyPicked !== undefined) upd.qty_picked = patch.qtyPicked;
       if (patch.bultosPicked !== undefined) upd.bultos_picked = patch.bultosPicked;
+      if (patch.committed !== undefined) upd.committed = patch.committed;
       upd.resolved_at = patch.status && patch.status !== "pending" ? new Date().toISOString() : null;
       const { error } = await client.from("order_lines").update(upd).eq("id", lineId);
       if (error) { console.error(error); }
